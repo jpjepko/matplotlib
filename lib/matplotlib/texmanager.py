@@ -26,6 +26,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import sqlite3
 from tempfile import TemporaryDirectory
 
 import numpy as np
@@ -60,7 +61,7 @@ class TexManager:
     Repeated calls to this constructor always return the same instance.
     """
 
-    texcache = os.path.join(mpl.get_cachedir(), 'tex.cache')
+    texcache = os.path.join(mpl.get_cachedir(), 'tex_cache_db.sqlite')
     _grey_arrayd = {}
 
     _font_families = ('serif', 'sans-serif', 'cursive', 'monospace')
@@ -102,7 +103,14 @@ class TexManager:
 
     @functools.lru_cache()  # Always return the same instance.
     def __new__(cls):
-        Path(cls.texcache).mkdir(parents=True, exist_ok=True)
+        if not Path(cls.texcache).is_file():
+            conn = sqlite3.connect(cls.texcache)
+            cur = conn.cursor()
+            cur.execute("CREATE TABLE cache ("
+                        "filehash VARCHAR(36) PRIMARY KEY,"  # 36 for hash+ext
+                        "filebytes BLOB NOT NULL"
+                        ");")
+            conn.close()
         return object.__new__(cls)
 
     @_api.deprecated("3.6")
@@ -171,13 +179,21 @@ class TexManager:
         return preamble, fontcmd
 
     @classmethod
+    def _exists_in_db(cls, filehash):
+        conn = sqlite3.connect(cls.texcache)
+        cur = conn.cursor()
+        query = "SELECT EXISTS(SELECT * FROM cache WHERE filehash=?)"
+        res = cur.execute(query, (filehash, )).fetchone()   # returns 1-tuple
+        conn.close()
+        return res[0] == 1
+
+    @classmethod
     def get_basefile(cls, tex, fontsize, dpi=None):
         """
         Return a filename based on a hash of the string, fontsize, and dpi.
         """
         src = cls._get_tex_source(tex, fontsize) + str(dpi)
-        return os.path.join(
-            cls.texcache, hashlib.md5(src.encode('utf-8')).hexdigest())
+        return hashlib.md5(src.encode('utf-8')).hexdigest()
 
     @classmethod
     def get_font_preamble(cls):
@@ -230,15 +246,38 @@ class TexManager:
         ])
 
     @classmethod
+    def _insert_blob_into_db(cls, filehash, filebytes):
+        conn = sqlite3.connect(cls.texcache)
+        cur = conn.cursor()
+
+        query = """INSERT INTO cache
+                   (filehash, filebytes) VALUES (?, ?)"""
+        try:
+            cur.execute(query, (filehash, filebytes))
+            conn.commit()
+        except sqlite3.Error as error:
+            raise RuntimeError(f"failed to insert blob into sqlite table: {error}")
+        finally:
+            conn.close()
+        conn.close()
+
+    @classmethod
     def make_tex(cls, tex, fontsize):
         """
         Generate a tex file to render the tex string at a specific font size.
 
-        Return the file name.
+        Return the file hash (key to table).
         """
+        conn = sqlite3.connect(cls.texcache)
+        cur = conn.cursor()
+
         texfile = cls.get_basefile(tex, fontsize) + ".tex"
-        Path(texfile).write_text(cls._get_tex_source(tex, fontsize),
-                                 encoding='utf-8')
+        texsrc = cls._get_tex_source(tex, fontsize)
+        texbytes = bytes(texsrc, "utf-8")
+        #Path(texfile).write_text(cls._get_tex_source(tex, fontsize),
+        #                         encoding='utf-8')
+        cls._insert_blob_into_db(texfile, texbytes)
+
         return texfile
 
     @classmethod
@@ -276,8 +315,8 @@ class TexManager:
         """
         basefile = cls.get_basefile(tex, fontsize)
         dvifile = '%s.dvi' % basefile
-        if not os.path.exists(dvifile):
-            texfile = Path(cls.make_tex(tex, fontsize))
+        if not cls._exists_in_db(dvifile):
+            #texfile = Path(cls.make_tex(tex, fontsize))
             # Generate the dvi in a temporary directory to avoid race
             # conditions e.g. if multiple processes try to process the same tex
             # string at the same time.  Having tmpdir be a subdirectory of the
@@ -290,11 +329,18 @@ class TexManager:
             cwd = Path(dvifile).parent
             with TemporaryDirectory(dir=cwd) as tmpdir:
                 tmppath = Path(tmpdir)
+                tmptexpath = tmppath / Path('%s.tex' % basefile)
+                tmptexpath.write_text(cls._get_tex_source(tex, fontsize),
+                                      encoding="utf-8")
                 cls._run_checked_subprocess(
                     ["latex", "-interaction=nonstopmode", "--halt-on-error",
                      f"--output-directory={tmppath.name}",
-                     f"{texfile.name}"], tex, cwd=cwd)
-                (tmppath / Path(dvifile).name).replace(dvifile)
+                     f"{tmptexpath.name}"], tex, cwd=cwd)
+                #(tmppath / Path(dvifile).name).replace(dvifile)
+                # Add generated dvi to db
+                dvipath = (tmppath / Path(dvifile).name)
+                dvibytes = dvipath.read_bytes()
+                cls._insert_blob_into_db(dvifile, dvibytes)
         return dvifile
 
     @classmethod
@@ -303,6 +349,7 @@ class TexManager:
         Generate a png file containing latex's rendering of tex string.
 
         Return the file name.
+        TODO: make it use db
         """
         basefile = cls.get_basefile(tex, fontsize, dpi)
         pngfile = '%s.png' % basefile
