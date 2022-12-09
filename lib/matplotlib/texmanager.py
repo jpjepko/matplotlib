@@ -100,7 +100,7 @@ class TexManager:
         'computer modern typewriter': 'monospace',
     }
 
-    @functools.lru_cache()  # Always return the same instance.
+    @functools.lru_cache()  # Always return the same instance (singleton)
     def __new__(cls):
         Path(cls.texcache).mkdir(parents=True, exist_ok=True)
         return object.__new__(cls)
@@ -176,8 +176,17 @@ class TexManager:
         Return a filename based on a hash of the string, fontsize, and dpi.
         """
         src = cls._get_tex_source(tex, fontsize) + str(dpi)
+        filehash = hashlib.md5(src.encode('utf-8')).hexdigest()
+
+        nested_folders = Path()
+        for i in range(0, 8, 2):    # 4-level 2-letter dirs
+            nested_folders = nested_folders / Path(filehash[i:i+2])
+
+        filepath = (Path(cls.texcache) / nested_folders)
+        filepath.mkdir(parents=True, exist_ok=True)
+
         return os.path.join(
-            cls.texcache, hashlib.md5(src.encode('utf-8')).hexdigest())
+               os.path.join(cls.texcache, nested_folders), filehash)
 
     @classmethod
     def get_font_preamble(cls):
